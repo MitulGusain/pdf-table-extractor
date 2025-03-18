@@ -1,112 +1,123 @@
 import os
-import fitz  # PyMuPDF
+import logging
+import argparse
+import pdfplumber
 import pandas as pd
 from openpyxl import Workbook
-import re
+from openpyxl.utils.dataframe import dataframe_to_rows
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def extract_text_from_pdf(pdf_path):
-    """Extract raw text from PDF."""
-    doc = fitz.open(pdf_path)
-    all_text = ""
+def extract_tables_from_pdf(pdf_path):
+    """
+    Extract tables from a PDF file using pdfplumber.
+    """
+    tables = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                logging.info(f"Processing page {page_num + 1} of {pdf_path}")
+                page_tables = page.extract_tables()
+                if page_tables:
+                    logging.info(f"Found {len(page_tables)} tables on page {page_num + 1}")
+                    tables.extend(page_tables)
+                else:
+                    logging.warning(f"No tables found on page {page_num + 1}")
+    except Exception as e:
+        logging.error(f"Error extracting tables from {pdf_path}: {e}")
+    return tables
 
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        text = page.get_text()
-        all_text += text + "\n"
+def validate_and_clean_table(table):
+    """
+    Validate and clean extracted table data.
+    """
+    if not table:
+        return None
+    # Remove empty rows and columns
+    cleaned_table = [row for row in table if any(cell and str(cell).strip() for cell in row)]
+    if not cleaned_table:
+        return None
+    return cleaned_table
 
-    doc.close()
-    return all_text
+def save_tables_to_excel(tables, output_path, pdf_name):
+    """
+    Save extracted tables to an Excel file.
+    """
+    try:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Table_1"
+        
+        for i, table in enumerate(tables):
+            if i > 0:
+                ws = wb.create_sheet(title=f"Table_{i + 1}")
+            df = pd.DataFrame(table)
+            for row in dataframe_to_rows(df, index=False, header=False):
+                ws.append(row)
+        
+        excel_file = os.path.join(output_path, f"{pdf_name}_tables.xlsx")
+        wb.save(excel_file)
+        logging.info(f"Saved tables to {excel_file}")
+    except Exception as e:
+        logging.error(f"Error saving tables to Excel: {e}")
 
+def process_pdf(pdf_path, output_path):
+    """
+    Process a single PDF file.
+    """
+    try:
+        logging.info(f"Processing PDF: {pdf_path}")
+        tables = extract_tables_from_pdf(pdf_path)
+        if not tables:
+            logging.warning(f"No tables found in {pdf_path}")
+            return
+        
+        cleaned_tables = [validate_and_clean_table(table) for table in tables]
+        cleaned_tables = [table for table in cleaned_tables if table]
+        
+        if not cleaned_tables:
+            logging.warning(f"No valid tables found in {pdf_path}")
+            return
+        
+        pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        save_tables_to_excel(cleaned_tables, output_path, pdf_name)
+    except Exception as e:
+        logging.error(f"Error processing {pdf_path}: {e}")
 
-def clean_text(raw_text):
-    """Normalize and clean extracted text."""
-    cleaned = re.sub(r'[^\x00-\x7F]+', ' ', raw_text)  # Remove non-ASCII characters
-    cleaned = re.sub(r'\s+', ' ', cleaned)  # Normalize whitespace
-    return cleaned.strip()
-
-
-def parse_transactions(raw_text):
-    """Parse transaction data from the extracted PDF text."""
-    # Regex pattern to match transaction rows
-    pattern = re.compile(
-        r'(\d{2}-[A-Z]{3}-\d{4})\s+([A-Z])\s+(.*?)\s+([\d,]+(?:\.\d{2})?)?\s+([\d,]+(?:\.\d{2})?)?\s+([\d,]+(?:\.\d{2})?Dr|Cr)?'
-    )
-
-    transactions = []
-
-    for match in pattern.finditer(raw_text):
-        date, txn_type, description, debit, credit, balance = match.groups()
-
-        # Clean the extracted data
-        debit = debit.replace(",", "") if debit else "0.00"
-        credit = credit.replace(",", "") if credit else "0.00"
-        balance = balance.replace(",", "") if balance else "0.00"
-
-        transactions.append({
-            "Date": date.strip(),
-            "Type": txn_type.strip(),
-            "Description": description.strip(),
-            "Debit": float(debit),
-            "Credit": float(credit),
-            "Balance": balance.strip()
-        })
-
-    return transactions
-
-
-def save_to_excel(transactions, output_path):
-    """Save transaction data to Excel."""
-    df = pd.DataFrame(transactions)
-
-    if df.empty:
-        print(f"⚠️ No transactions found. Skipping {output_path}")
+def process_folder(input_folder, output_folder):
+    """
+    Process all PDFs in a folder.
+    """
+    if not os.path.exists(input_folder):
+        logging.error(f"Input folder does not exist: {input_folder}")
         return
-
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Transactions')
-
-    print(f"✅ Transactions saved to {output_path}")
-
-
-def process_pdf(input_folder, output_folder):
-    """Process all PDFs in the folder."""
-    os.makedirs(output_folder, exist_ok=True)
-
-    pdf_files = [f for f in os.listdir(input_folder) if f.endswith('.pdf')]
-
-    if not pdf_files:
-        print("❌ No PDF files found in the folder.")
-        return
-
-    for pdf_file in pdf_files:
-        pdf_path = os.path.join(input_folder, pdf_file)
-        output_path = os.path.join(output_folder, f"{os.path.splitext(pdf_file)[0]}.xlsx")
-
-        print(f"🔍 Processing {pdf_file}...")
-
-        # Extract raw text
-        raw_text = extract_text_from_pdf(pdf_path)
-        cleaned_text = clean_text(raw_text)
-
-        # Parse transactions
-        transactions = parse_transactions(cleaned_text)
-
-        # Save to Excel
-        if transactions:
-            save_to_excel(transactions, output_path)
-        else:
-            print(f"⚠️ No transactions found in {pdf_file}")
-
+    
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        logging.info(f"Created output folder: {output_folder}")
+    
+    for filename in os.listdir(input_folder):
+        if filename.endswith(".pdf"):
+            pdf_path = os.path.join(input_folder, filename)
+            logging.info(f"Found PDF: {filename}")
+            process_pdf(pdf_path, output_folder)
 
 def main():
-    """Main execution function."""
-    input_folder = "./pdfs"
-    output_folder = "./output"
-
-    process_pdf(input_folder, output_folder)
-    print("\n✅ Batch processing completed!")
-
+    """
+    Command-line interface for the tool.
+    """
+    parser = argparse.ArgumentParser(description="Extract tables from PDFs and save them to Excel files.")
+    parser.add_argument("input", help="Path to the input PDF file or folder.")
+    parser.add_argument("output", help="Path to the output folder for Excel files.")
+    args = parser.parse_args()
+    
+    if os.path.isfile(args.input) and args.input.endswith(".pdf"):
+        process_pdf(args.input, args.output)
+    elif os.path.isdir(args.input):
+        process_folder(args.input, args.output)
+    else:
+        logging.error("Invalid input path. Please provide a valid PDF file or folder.")
 
 if __name__ == "__main__":
     main()
